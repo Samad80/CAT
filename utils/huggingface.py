@@ -1,9 +1,22 @@
 # =============================================
 # Exam Tutor AI — Hugging Face API Client
 # =============================================
+# Uses router.huggingface.co with multiple
+# free inference providers as fallbacks.
 
 import os
 import requests
+
+
+# Provider + model combinations that are free and require no license.
+# router.huggingface.co routes to these automatically.
+FREE_PROVIDERS = [
+    # provider,         model
+    ("novita",          "meta-llama/Llama-3.2-3B-Instruct"),
+    ("sambanova",       "meta-llama/Llama-3.2-3B-Instruct"),
+    ("featherless-ai",  "HuggingFaceH4/zephyr-7b-beta"),
+    ("nebius",          "meta-llama/Llama-3.2-3B-Instruct"),
+]
 
 
 def call_huggingface(prompt: str, max_tokens: int = 2048, temperature: float = 0.7) -> str:
@@ -14,50 +27,58 @@ def call_huggingface(prompt: str, max_tokens: int = 2048, temperature: float = 0
             "New secret → Name: HF_TOKEN, Value: your token from huggingface.co/settings/tokens"
         )
 
-    model = os.environ.get("HUGGINGFACE_MODEL", "HuggingFaceH4/zephyr-7b-beta")
+    # Allow override via env var (format: "provider/model")
+    override = os.environ.get("HUGGINGFACE_MODEL", "")
+    if "/" in override and override.count("/") >= 2:
+        # e.g. "novita/meta-llama/Llama-3.2-3B-Instruct"
+        parts = override.split("/", 1)
+        providers_to_try = [(parts[0], parts[1])]
+    else:
+        providers_to_try = FREE_PROVIDERS
 
-    # router.huggingface.co resolves correctly on HF Spaces
-    url = f"https://router.huggingface.co/hf-inference/models/{model}/v1/chat/completions"
+    last_error = ""
+    for provider, model in providers_to_try:
+        url = f"https://router.huggingface.co/{provider}/v1/chat/completions"
+        try:
+            resp = requests.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "stream": False,
+                },
+                timeout=60,
+            )
+        except requests.exceptions.ConnectionError as e:
+            last_error = f"[{provider}] Connection failed: {e}"
+            continue
+        except requests.exceptions.Timeout:
+            last_error = f"[{provider}] Timed out"
+            continue
 
-    try:
-        resp = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "stream": False,
-            },
-            timeout=60,
-        )
-    except requests.exceptions.ConnectionError as e:
-        raise RuntimeError(f"Connection failed: {e}")
-    except requests.exceptions.Timeout:
-        raise RuntimeError("Request timed out. Please try again.")
+        if resp.status_code == 401:
+            raise ValueError(
+                "Invalid token. Check HF_TOKEN in your Space secrets — "
+                "get a fresh one at huggingface.co/settings/tokens"
+            )
 
-    if resp.status_code == 401:
-        raise ValueError(
-            "Invalid token. Check HF_TOKEN in your Space secrets — "
-            "get one at huggingface.co/settings/tokens"
-        )
-    if resp.status_code == 403:
-        raise ValueError(
-            f'Access denied to "{model}". '
-            f"Accept its license at huggingface.co/{model} "
-            "or change HUGGINGFACE_MODEL to a different model."
-        )
-    if resp.status_code == 404:
-        raise ValueError(f'Model "{model}" not found. Check HUGGINGFACE_MODEL in your Space settings.')
-    if resp.status_code == 429:
-        raise RuntimeError("Rate limit reached. Wait a moment and try again.")
-    if resp.status_code == 503:
-        raise RuntimeError("Model is loading. Wait ~30 seconds and try again.")
-    if not resp.ok:
-        raise RuntimeError(f"API error ({resp.status_code}): {resp.text[:200]}")
+        if resp.ok:
+            try:
+                return resp.json()["choices"][0]["message"]["content"].strip()
+            except (KeyError, IndexError) as e:
+                last_error = f"[{provider}] Unexpected response format: {e}"
+                continue
 
-    return resp.json()["choices"][0]["message"]["content"].strip()
+        last_error = f"[{provider}] HTTP {resp.status_code}: {resp.text[:150]}"
+        # Keep trying next provider
+
+    raise RuntimeError(
+        f"All inference providers failed. Last error: {last_error}\n"
+        "Check that your HF_TOKEN is valid and has Read permissions."
+    )
